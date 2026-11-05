@@ -1,144 +1,158 @@
-# HealthGuard AI — Healthcare Insurance Fraud & Readmission Risk Platform
+# HealthGuard AI
 
-End-to-end healthcare risk analytics: **insurance-claim fraud detection**, **unsupervised anomaly detection**, and **30-day hospital readmission prediction**, with **SHAP** explanations, an **LLM explanation layer** that turns model output into analyst-readable summaries, and an interactive **Streamlit** dashboard for claim-, patient- and provider-level review.
+Healthcare Insurance Fraud & Readmission Risk Platform
 
-`Python · SQL (DuckDB) · XGBoost · Scikit-learn · SHAP · LLM · Streamlit · Plotly`
+This project looks at two problems in healthcare data:
 
-![Overview](docs/screenshots/overview.png)
+1. Which providers (hospitals, clinics) are likely submitting fraudulent insurance claims.
+2. Which diabetic patients are likely to be readmitted to hospital within 30 days of discharge.
 
----
+It builds features from the raw data using SQL, trains machine-learning models, explains each prediction with SHAP, and shows everything in a Streamlit dashboard.
 
-## Results (held-out data)
+Tech: Python, SQL (DuckDB), XGBoost, Scikit-learn, SHAP, Streamlit, Plotly
 
-| Model | Level | Metric | Result |
-|---|---|---|---|
-| XGBoost fraud classifier | Provider (5,410) | ROC-AUC, 5-fold × 2 repeated CV | **0.941 ± 0.006** |
-| | | PR-AUC (base rate 9.4%) | **0.69** (≈7× random) |
-| | | Holdout recall / precision @ best-F1 threshold | **79% / 62%** |
-| | | Fraudulent providers caught reviewing top 10% | **71%** (7.1× lift) |
-| Risk tiers (out-of-fold) | Provider | Labelled-fraud rate: Critical / High / Medium / Low | **89% / 47% / 15% / 2%** |
-| Isolation Forest (no labels) | Provider | ROC-AUC vs fraud labels | **0.82**; top-5% = 4.0× lift |
-| XGBoost readmission | Encounter (99,343) | ROC-AUC (patient-grouped holdout) | **0.683** (LogReg baseline 0.667) |
-| | | Observed readmission: High / Medium / Low band | **28.5% / 15.1% / 7.4%** |
+![Dashboard overview](docs/screenshots/overview.png)
 
-The Critical + High tiers flag **667 providers (12% of providers)** that account for **68% ($377M)** of total reimbursement — a focused audit queue.
+## Data
 
-**Honest notes** — the numbers a reviewer will ask about:
-- On provider fraud, XGBoost is only slightly ahead of a well-regularised logistic regression (0.941 vs 0.936 CV ROC-AUC). The aggregated SQL features do most of the work; XGBoost adds non-linear interactions and exact TreeSHAP explanations.
-- The single 20% holdout contains ~100 fraudulent providers, so its ROC-AUC (0.964) is noisier than the repeated-CV figure — CV is the headline.
-- Claim-level fraud (ROC-AUC 0.65) is weak because the labels exist only at provider level; claims inherit their provider's label. Claim-level Isolation Forest is ~random (0.52): fraud in this data shows up in *billing patterns across a provider's book*, not in individually odd claims. That is why claim risk blends provider probability, claim probability and anomaly percentile.
-- Readmission AUC of ~0.68 is in line with published work on this dataset (typically 0.64–0.70); readmission is hard to predict from administrative data. The model is well calibrated, which matters more for care-management triage than raw AUC.
+Two public Kaggle datasets:
 
----
-
-## Data (Kaggle)
-
-| Dataset | Kaggle slug | Used for |
+| Dataset | Size | Used for |
 |---|---|---|
-| Healthcare Provider Fraud Detection Analysis | `rohitrox/healthcare-provider-fraud-detection-analysis` | 558,211 inpatient + outpatient claims, 138,556 beneficiaries, 5,410 labelled providers |
-| Diabetes 130-US Hospitals (1999–2008) | `brandao/diabetes` | 101,766 encounters with readmission outcome (`<30`, `>30`, `NO`) |
+| [Healthcare Provider Fraud Detection](https://www.kaggle.com/datasets/rohitrox/healthcare-provider-fraud-detection-analysis) | 558,211 claims, 138,556 patients, 5,410 providers | Fraud detection |
+| [Diabetes 130-US Hospitals (1999-2008)](https://www.kaggle.com/datasets/brandao/diabetes) | 101,766 hospital admissions | Readmission prediction |
 
-Data is downloaded by `scripts/download_data.py` and is **not** committed (see `.gitignore`).
+In the fraud dataset, Kaggle marks each provider as potential fraud or not. About 9% of providers are marked as fraud. The labels are for providers, not individual claims.
 
----
+For readmission, I removed admissions where the patient died or went to hospice, leaving 99,343 admissions. 11.4% of them were readmitted within 30 days.
 
 ## Architecture
 
-```mermaid
-flowchart LR
-  K[(Kaggle CSVs)] --> D[DuckDB SQL<br/>sql/01-03]
-  D --> C[Claim features]
-  D --> P[Patient features]
-  D --> V[Provider features]
-  V --> XP[XGBoost<br/>provider fraud]
-  C --> XC[XGBoost<br/>claim fraud]
-  C & V & P --> IF[Isolation Forests]
-  XP & XC & IF --> T[Risk scores + tiers]
-  R[(Readmission CSV)] --> RF[Feature eng.<br/>ICD-9 groups, med changes] --> XR[XGBoost<br/>30-day readmit]
-  T & XR --> S[TreeSHAP drivers + peer medians]
-  S --> L[LLM explainer<br/>Claude / OpenAI / Ollama / offline template]
-  T & XR & S & L --> UI[Streamlit dashboard]
+```
+Kaggle CSVs
+    |
+    v
+SQL feature engineering (DuckDB)
+    - claim level:    amount vs similar claims, length of stay, number of doctors, duplicates
+    - patient level:  number of providers visited, chronic conditions, total spend
+    - provider level: 35 features summarising each provider's claims
+    |
+    v
+Models
+    - XGBoost: fraud probability per provider and per claim
+    - Isolation Forest: anomaly score (no labels used)
+    - XGBoost: 30-day readmission probability
+    |
+    v
+Risk tiers (Critical / High / Medium / Low) + SHAP explanation for each prediction
+    |
+    v
+LLM summary (optional) + Streamlit dashboard
 ```
 
-### 1 · SQL feature engineering (`sql/`, run by DuckDB)
-- **Claim level** — amount vs. clinical peer group (same DRG for inpatient / same primary diagnosis for outpatient, shrunk for small groups), length of stay, claim duration, diagnosis/procedure counts, physicians on claim, attending = operating, duplicate same-day claims, patient context, attending-physician volume and how many providers that physician bills through.
-- **Patient level** — providers visited (doctor-shopping), claims, chronic-condition count, spend, duplicate claims.
-- **Provider level** — 35 aggregates: volume, inpatient share, claims per patient, reimbursement distribution, share of claims billed >2× peers, physician network spread, geographic spread of the patient base, diagnosis/DRG diversity, patient case-mix.
+**Feature engineering.** Three SQL files in `sql/` turn the raw claims into features. For example, each claim's amount is compared with other claims that have the same diagnosis group, and each provider gets features such as claims per patient, average length of stay and how many different doctors bill through it.
 
-### 2 · Models (`src/healthguard/`)
-- **Provider fraud** — XGBoost (`max_depth=3`, 800 trees, chosen by 5-fold CV on the training split only) with a logistic-regression baseline.
-- **Claim fraud** — XGBoost on claim + patient features; claims inherit the provider label.
-- **Anomaly detection** — Isolation Forests on log-scaled claim, provider and patient features, fitted without labels.
-- **Risk tiers** — provider: *Critical* = probability ≥ the threshold that gave 85% precision out-of-fold, *High* = best-F1 threshold, *Medium* = half that or top-3% anomaly; claim / patient: blended score, top 2% / next 8% / next 20%.
-- **Readmission** — XGBoost with native categoricals and early stopping; ICD-9 chapter grouping, medication-change counts, HbA1c / glucose flags, prior utilisation, and prior encounters for the same patient (counting only earlier encounters).
+**Fraud models.** The provider model is trained on the 35 provider features. The claim model is trained on claim features, with each claim taking its provider's label. An Isolation Forest scores how unusual each claim, provider and patient is without using any labels.
 
-**Leakage controls:** provider and claim models share one provider-stratified split, so a provider's claims are never in both train and test; dashboard scores are 5-fold **out-of-fold** predictions; the readmission split is **grouped by patient** (patients have up to 40 encounters); expired/hospice discharges are removed from readmission data.
+**Readmission model.** XGBoost trained on admission details: age, length of stay, prior visits, diagnoses grouped by ICD-9 category, medication changes and lab results.
 
-### 3 · Explainability + LLM layer
-- `explain.py` computes exact TreeSHAP contributions with XGBoost (`pred_contribs`) and maps every feature to plain English.
-- `llm_explainer.py` sends **only structured facts** (score, tier, top SHAP drivers with values and peer medians) to an LLM with a system prompt that forbids inventing facts or accusing anyone, and asks for a headline, key drivers and one proportionate next step.
-- Backends: Anthropic Claude (`ANTHROPIC_API_KEY`), OpenAI (`OPENAI_API_KEY`), local Ollama (`OLLAMA_HOST`), or a deterministic **offline template** used automatically when no key is set or a call fails — the app never breaks without an API key.
+**Explanations.** SHAP shows which features pushed each prediction up or down. The dashboard compares those features with the median provider. An optional LLM step (Groq) turns the SHAP output into a short written summary. Without an API key, a fixed template is used instead.
 
-### 4 · Dashboard (`app/streamlit_app.py`)
-| Page | What it does |
+**Avoiding leakage.**
+- A provider's claims are never split between training and test data.
+- The scores shown in the dashboard come from models that did not see that provider during training (5-fold out-of-fold predictions).
+- In the readmission data, all admissions of one patient stay in the same split.
+
+## Results
+
+All numbers are on data the models were not trained on.
+
+**Provider fraud (XGBoost)**
+
+| Metric | Result |
 |---|---|
-| Overview | KPIs, reimbursement and labelled-fraud rate by tier, top-risk providers |
-| Provider risk | Filterable queue → SHAP drivers, peer comparison, LLM summary, riskiest claims |
-| Claim explorer | Supervised vs anomaly scatter, filters, per-claim SHAP + summary |
-| Patient risk | Provider-hopping, patients' unusual attributes (z-scores), claim history |
-| Readmission risk | Bands vs observed rates, calibration, editable what-if scorer with SHAP + summary |
-| Model performance | Holdout metrics, baselines, ROC / PR curves, global SHAP plots |
+| ROC-AUC (5-fold cross-validation, repeated twice) | 0.941 ± 0.006 |
+| PR-AUC | 0.69 (fraud rate is 9.4%) |
+| Fraudulent providers found in the top 10% of scores | 71% |
+| Logistic regression baseline, ROC-AUC | 0.936 |
 
-![Provider drill-down](docs/screenshots/provider.png)
+**Risk tiers (provider level)**
 
----
+| Tier | Providers | Share actually marked fraud |
+|---|---|---|
+| Critical | 131 | 89% |
+| High | 536 | 47% |
+| Medium | 394 | 15% |
+| Low | 4,349 | 2% |
 
-## Run it
+**Other models**
+
+| Model | Result |
+|---|---|
+| Isolation Forest, provider level (no labels used) | ROC-AUC 0.82 |
+| Claim-level fraud (XGBoost) | ROC-AUC 0.65 |
+| 30-day readmission (XGBoost) | ROC-AUC 0.68 (logistic regression: 0.67) |
+| Readmission rate by predicted risk band | High 28.5%, Medium 15.1%, Low 7.4% |
+
+**What these results mean**
+- XGBoost is only slightly better than logistic regression on provider fraud. Most of the signal comes from the engineered features.
+- Fraud in this dataset is concentrated among large providers. Total amount reimbursed is the strongest single feature.
+- The claim-level model is weak because the labels exist only for providers, so every claim from a fraudulent provider is labelled fraud even if that claim was normal.
+- Readmission is hard to predict from hospital records alone. An ROC-AUC around 0.68 is in line with other published work on this dataset.
+
+The full metrics are in `reports/metrics_fraud.json` and `reports/metrics_readmission.json`, and the SHAP plots are in `reports/figures/`.
+
+## Dashboard
+
+| Page | Shows |
+|---|---|
+| Overview | Totals, reimbursement by risk tier, highest-risk providers |
+| Provider risk | Filter providers, see the SHAP drivers, compare with other providers, read the summary |
+| Claim explorer | Filter claims, compare the model score with the anomaly score |
+| Patient risk | Patients who visit many providers, and their claim history |
+| Readmission risk | Score an admission and change the inputs to see how the risk moves |
+| Model performance | Test metrics, ROC and precision-recall curves, SHAP plots |
+
+![Provider page](docs/screenshots/provider.png)
+
+## How to run
 
 ```bash
-git clone https://github.com/nirdoshk0228/healthguard-ai.git
-cd healthguard-ai
-python -m venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\activate
+git clone https://github.com/nirdoshk0228/Health-guard-system.git
+cd Health-guard-system
 pip install -r requirements.txt
 
-# The raw Kaggle CSVs ship in data/raw/ in the project zip, so this step just skips.
-# On a fresh clone (data is git-ignored) it downloads them; it needs a Kaggle API token:
-# Kaggle → Settings → API → Create New Token → save to ~/.kaggle/kaggle.json
-python scripts/download_data.py
-python run_pipeline.py            # ~3 minutes: SQL features → models → metrics → SHAP plots
+python scripts/download_data.py      # downloads the Kaggle data (needs a Kaggle API token)
+python run_pipeline.py               # builds features and trains all models, about 3 minutes
 streamlit run app/streamlit_app.py
-
-# optional: real LLM summaries instead of the offline template
-pip install anthropic && export ANTHROPIC_API_KEY=...   # or OPENAI_API_KEY / OLLAMA_HOST
-pytest -q
 ```
 
-## Repository layout
+To get LLM summaries, copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and add a Groq API key. Without a key, the template summaries are used.
+
+Tests: `pytest -q`
+
+## Project structure
 
 ```
-healthguard-ai/
-├── app/streamlit_app.py          # dashboard
-├── scripts/download_data.py      # Kaggle download (kagglehub, falls back to kaggle CLI)
-├── sql/                          # DuckDB feature engineering
-│   ├── 01_claims.sql
-│   ├── 02_patients_physicians.sql
-│   └── 03_providers.sql
-├── src/healthguard/
-│   ├── config.py                 # paths, dataset slugs
-│   ├── features_fraud.py         # runs the SQL, defines feature sets
-│   ├── features_readmission.py   # ICD-9 grouping, medication features
-│   ├── train_fraud.py            # XGBoost + Isolation Forest + tiers + SHAP
-│   ├── train_readmission.py      # XGBoost + baseline + calibration + SHAP
-│   ├── explain.py                # TreeSHAP + plain-English feature labels
-│   ├── llm_explainer.py          # Claude / OpenAI / Ollama / template
-│   ├── scoring.py                # builds explainable cases for the app
-│   └── metrics.py
-├── reports/                      # metrics_*.json, SHAP figures
-├── tests/test_core.py
-└── run_pipeline.py
+app/streamlit_app.py          dashboard
+scripts/download_data.py      downloads the Kaggle data
+scripts/test_llm.py           checks the LLM summary works
+sql/                          feature engineering in SQL
+src/healthguard/
+    features_fraud.py         runs the SQL and defines the feature lists
+    features_readmission.py   readmission features
+    train_fraud.py            fraud models, Isolation Forest, risk tiers
+    train_readmission.py      readmission model
+    explain.py                SHAP
+    llm_explainer.py          LLM and template summaries
+    scoring.py                prepares data for the dashboard
+reports/                      saved metrics and SHAP plots
+tests/                        unit tests
+run_pipeline.py               runs everything in order
 ```
 
 ## Limitations
-- The fraud dataset is a public, Medicare-style teaching dataset; labels are provider-level "potential fraud" flags, not adjudicated cases.
-- Scores prioritise review — they are not evidence. The LLM layer is constrained to model facts and phrased for a human reviewer.
-- Readmission features are administrative; adding social determinants, follow-up scheduling or prior-claims history would be the next lift.
+
+- The fraud labels are Kaggle's "potential fraud" flags, not confirmed cases.
+- A high score means a provider should be reviewed, not that fraud has happened.
+- The readmission model only uses data from the hospital stay. Information such as follow-up appointments would likely improve it.
